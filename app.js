@@ -2,7 +2,13 @@ const STORAGE_TASKS = 'todo-tasks';
 const STORAGE_NOTES = 'todo-notes';
 
 const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
- 
+
+const FILTERS = [
+  ['all', 'Все'],
+  ['active', 'Невыполненные'],
+  ['done', 'Выполненные'],
+];
+
 const MAX_TITLE = 120;
 const ISO_RE = /^\d{4}-\d{2}-\d{2}$/;
  
@@ -81,7 +87,6 @@ function saveTasks() {
   try {
     localStorage.setItem(STORAGE_TASKS, JSON.stringify(state.tasks));
   } catch {
-    /* хранилище недоступно — работаем без сохранения */
   }
 }
 
@@ -99,10 +104,15 @@ const currentWeekDates = () => Array.from({ length: 7 }, (_, i) => toISO(addDays
 const state = {
   tasks: loadTasks(),
   notes: loadNotes(),
+  filter: 'all',
+  query: '',
   weekStart: startOfWeek(new Date()),
+  editingId: null,
 };
 
 const ui = {
+  search: null,
+  filterButtons: [],
   pileList: null,
   rangeLabel: null,
   grid: null,
@@ -113,14 +123,53 @@ const ui = {
 function addTask(title, date) {
   const task = { id: newId(), title, date, done: false };
   state.tasks.push(task);
+  if (!matches(task)) resetFilters();
   saveTasks();
   renderTasks();
 }
 
-function buildTaskRow(task, today, showDate) {
-  const status = task.done ? 'done' : !task.date ? 'undated' : task.date < today ? 'overdue' : 'upcoming';
+function toggleDone(id) {
+  const task = state.tasks.find((t) => t.id === id);
+  if (!task) return;
+  task.done = !task.done;
+  saveTasks();
+  renderTasks();
+}
+ 
+function deleteTask(id) {
+  state.tasks = state.tasks.filter((t) => t.id !== id);
+  if (state.editingId === id) state.editingId = null;
+  saveTasks();
+  renderTasks();
+}
+ 
+function startEdit(id) {
+  state.editingId = id;
 
-  const check = el('span', { className: 'task__check' });
+  renderTasks();
+  const field = document.querySelector('.task-edit__title');
+  if (field) field.focus();
+}
+ 
+function cancelRowMode() {
+  state.editingId = null;
+  renderTasks();
+}
+
+function buildTaskRow(task, today, showDate) {
+  if (state.editingId === task.id) return buildEditRow(task);
+
+  const status = task.done ? 'done' : !task.date ? 'undated' : task.date < today ? 'overdue' : 'upcoming';
+  
+  const check = el('button', {
+    className: 'task__check',
+    attrs: {
+      type: 'button',
+      'aria-pressed': String(task.done),
+      'aria-label': task.done ? 'Отметить невыполненной' : 'Отметить выполненной',
+    },
+    on: { click: () => toggleDone(task.id) },
+  });
 
   const title = el(
     'span',
@@ -133,7 +182,24 @@ function buildTaskRow(task, today, showDate) {
       ? el('time', { className: 'task__date', text: shortDate(task.date), attrs: { datetime: task.date } })
       : null;
 
-  const li = el(
+   const actions = el(
+    'div',
+    { className: 'task__actions' },
+    el('button', {
+      className: 'task__btn',
+      text: '✎',
+      attrs: { type: 'button', 'aria-label': `Редактировать: ${task.title}`, title: 'Редактировать' },
+      on: { click: () => startEdit(task.id) },
+    }),
+    el('button', {
+      className: 'task__btn',
+      text: '×',
+      attrs: { type: 'button', 'aria-label': `Удалить: ${task.title}`, title: 'Удалить' },
+      on: { click: () => deleteTask(task.id) },
+    })
+    );
+
+   const li = el(
     'li',
     {
       className: `task task--${status}`,
@@ -141,10 +207,76 @@ function buildTaskRow(task, today, showDate) {
     },
     check,
     title,
-    date
+    date,
+    actions
   );
 
   return li;
+}
+
+function buildEditRow(task) {
+  const titleInput = el('input', {
+    className: 'task-edit__title',
+    attrs: { type: 'text', maxlength: MAX_TITLE, 'aria-label': 'Название задачи', autocomplete: 'off' },
+  });
+  titleInput.value = task.title;
+ 
+  const dateInput = el('input', {
+    className: 'task-edit__date',
+    attrs: { type: 'date', 'aria-label': 'Дата (можно очистить — задача уйдёт в общий список)' },
+  });
+  dateInput.value = task.date || '';
+ 
+  const error = el('p', { className: 'form-error', attrs: { role: 'alert' } });
+ 
+  const form = el(
+    'form',
+    {
+      className: 'task-edit',
+      attrs: { novalidate: true },
+      on: {
+        submit: (e) => {
+          e.preventDefault();
+          const title = titleInput.value.trim();
+          if (!title) {
+            error.textContent = 'Название не может быть пустым';
+            titleInput.classList.add('is-invalid');
+            titleInput.focus();
+            return;
+          }
+          task.title = title;
+          task.date = dateInput.value || null;
+          state.editingId = null;
+          saveTasks();
+          renderTasks();
+        },
+        keydown: (e) => {
+          if (e.key === 'Escape') cancelRowMode();
+        },
+      },
+    },
+    titleInput,
+    el(
+      'div',
+      { className: 'task-edit__row' },
+      dateInput,
+      el('button', { className: 'btn btn--small btn--primary', text: 'Сохранить', attrs: { type: 'submit' } }),
+      el('button', {
+        className: 'btn btn--small',
+        text: 'Отмена',
+        attrs: { type: 'button' },
+        on: { click: cancelRowMode },
+      })
+    ),
+    error
+  );
+ 
+  titleInput.addEventListener('input', () => {
+    error.textContent = '';
+    titleInput.classList.remove('is-invalid');
+  });
+ 
+  return el('li', { className: 'task task--editing', dataset: { id: task.id } }, form);
 }
 
 function renderTasks() {
@@ -152,7 +284,7 @@ function renderTasks() {
   const groups = new Map([['pile', []]]);
   ui.dayLists.forEach((_, iso) => groups.set(iso, []));
 
-  const visible = state.tasks;
+  const visible = state.tasks.filter(matches);
   const weekDates = new Set(ui.dayLists.keys());
   visible.forEach((task) => {
     const key = task.date && weekDates.has(task.date) ? task.date : 'pile';
@@ -162,10 +294,13 @@ function renderTasks() {
   const pileTasks = groups.get('pile');
   const pileNodes = pileTasks.map((task) => buildTaskRow(task, today, true));
   if (pileNodes.length === 0) {
+    const filtersActive = state.query !== '' || state.filter !== 'all';
     const message =
       state.tasks.length === 0
         ? 'Пока нет задач. Добавь первую выше.'
-        : 'Список пуст — всё распланировано.';
+        :filtersActive
+          ? 'Ничего не найдено...'
+          : 'Список пуст — всё распланировано.';
     pileNodes.push(el('li', { className: 'empty', text: message }));
   }
   ui.pileList.replaceChildren(...pileNodes);
@@ -175,7 +310,86 @@ function renderTasks() {
   });
 }
 
+function updateFilterButtons() {
+  ui.filterButtons.forEach((btn) => {
+    const active = btn.dataset.filter === state.filter;
+    btn.setAttribute('aria-pressed', String(active));
+    btn.classList.toggle('is-active', active);
+  });
+}
+ 
+function buildToolbar() {
+  ui.search = el('input', {
+    className: 'toolbar__search',
+    attrs: {
+      type: 'search',
+      placeholder: 'Поиск по названию',
+      'aria-label': 'Поиск задач по названию',
+      autocomplete: 'off',
+    },
+    on: {
+      input: (e) => {
+        state.query = e.target.value.trim().toLowerCase();
+        renderTasks();
+      },
+    },
+  });
+ 
+  const group = el('div', {
+    className: 'segmented',
+    attrs: { role: 'group', 'aria-label': 'Фильтр по статусу' },
+  });
+  ui.filterButtons = FILTERS.map(([value, label]) => {
+    const btn = el('button', {
+      className: 'segmented__btn',
+      text: label,
+      attrs: { type: 'button' },
+      dataset: { filter: value },
+      on: {
+        click: () => {
+          state.filter = value;
+          updateFilterButtons();
+          renderTasks();
+        },
+      },
+    });
+    group.append(btn);
+    return btn;
+  });
+  updateFilterButtons();
+ 
+  const legend = el(
+    'ul',
+    { className: 'legend', attrs: { 'aria-label': 'Обозначения' } },
+    el('li', { className: 'legend__item legend__item--overdue', text: 'Просрочено' }),
+    el('li', { className: 'legend__item legend__item--upcoming', text: 'Предстоит' }),
+    el('li', { className: 'legend__item legend__item--done', text: 'Выполнено' })
+  );
+ 
+  return el(
+    'form',
+    { className: 'toolbar', attrs: { role: 'search' }, on: { submit: (e) => e.preventDefault() } },
+    ui.search,
+    group,
+    legend
+  );
+}
+
 const newId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+
+function matches(task) {
+  if (state.filter === 'active' && task.done) return false;
+  if (state.filter === 'done' && !task.done) return false;
+  if (state.query && !task.title.toLowerCase().includes(state.query)) return false;
+  return true;
+}
+ 
+function resetFilters() {
+  state.filter = 'all';
+  state.query = '';
+  if (ui.search) ui.search.value = '';
+  updateFilterButtons();
+}
 
 function buildHeader() {
   return el(
@@ -332,6 +546,7 @@ function buildWeekSection() {
 function startApp() {
   document.body.append(buildHeader());
   const main = el('main', { className: 'container main' });
+  main.append(buildToolbar());
   const layout = el('div', { className: 'layout' });
   layout.append(buildPile());
   layout.append(buildWeekSection());
