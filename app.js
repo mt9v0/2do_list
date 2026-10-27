@@ -1,5 +1,6 @@
 const STORAGE_TASKS = 'todo-tasks';
 const STORAGE_NOTES = 'todo-notes';
+const STORAGE_SORT = 'todo-sort';
 
 const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'];
 
@@ -18,6 +19,12 @@ const STATUS_TEXT = {
   undated: 'без даты',
   done: 'выполнено',
 };
+
+const SORTS = [
+  ['manual', 'Вручную'],
+  ['asc', 'По дате: сначала ранние'],
+  ['desc', 'По дате: сначала поздние'],
+];
 
 const pad = (n) => String(n).padStart(2, '0');
 const toISO = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -99,6 +106,22 @@ function loadNotes() {
   }
 }
 
+function loadSort() {
+  try {
+    const value = localStorage.getItem(STORAGE_SORT);
+    return SORTS.some(([key]) => key === value) ? value : 'manual';
+  } catch {
+    return 'manual';
+  }
+}
+ 
+function saveSort() {
+  try {
+    localStorage.setItem(STORAGE_SORT, state.sort);
+  } catch {
+  }
+}
+
 const currentWeekDates = () => Array.from({ length: 7 }, (_, i) => toISO(addDays(state.weekStart, i)));
 
 const state = {
@@ -106,6 +129,7 @@ const state = {
   notes: loadNotes(),
   filter: 'all',
   query: '',
+  sort: loadSort(),
   weekStart: startOfWeek(new Date()),
   editingId: null,
 };
@@ -279,6 +303,14 @@ function buildEditRow(task) {
   return el('li', { className: 'task task--editing', dataset: { id: task.id } }, form);
 }
 
+function compareByDate(a, b) {
+  if (a.date === b.date) return 0;
+  if (!a.date) return 1;
+  if (!b.date) return -1;
+  const result = a.date < b.date ? -1 : 1;
+  return state.sort === 'desc' ? -result : result;
+}
+
 function renderTasks() {
   const today = toISO(new Date());
   const groups = new Map([['pile', []]]);
@@ -291,6 +323,7 @@ function renderTasks() {
     groups.get(key).push(task);
   });
 
+  if (state.sort !== 'manual') groups.get('pile').sort(compareByDate);
   const pileTasks = groups.get('pile');
   const pileNodes = pileTasks.map((task) => buildTaskRow(task, today, true));
   if (pileNodes.length === 0) {
@@ -460,6 +493,27 @@ function buildPile() {
     error
   );
  
+  ui.sortSelect = el('select', {
+    className: 'field field--select',
+    attrs: { id: 'pile-sort' },
+    on: {
+      change: (e) => {
+        state.sort = e.target.value;
+        saveSort();
+        renderTasks();
+      },
+    },
+  });
+  SORTS.forEach(([value, label]) => ui.sortSelect.append(el('option', { text: label, attrs: { value } })));
+  ui.sortSelect.value = state.sort;
+ 
+  const sortRow = el(
+    'label',
+    { className: 'pile__sort', attrs: { for: 'pile-sort' } },
+    el('span', { text: 'Порядок' }),
+    ui.sortSelect
+  );
+
   const section = el(
     'section',
     { className: 'pile' },
@@ -468,7 +522,8 @@ function buildPile() {
       className: 'pile__hint',
     }),
     form,
-    ui.pileList
+    ui.pileList,
+    sortRow
   );
   return section;
 }
