@@ -22,8 +22,8 @@ const STATUS_TEXT = {
 
 const SORTS = [
   ['manual', 'Вручную'],
-  ['asc', 'По дате: сначала ранние'],
-  ['desc', 'По дате: сначала поздние'],
+  ['asc', 'По дате: сначала ближайшие'],
+  ['desc', 'По дате: сначала дальние'],
 ];
 
 const pad = (n) => String(n).padStart(2, '0');
@@ -84,7 +84,7 @@ function loadTasks() {
           typeof t.done === 'boolean' &&
           (t.date === null || (typeof t.date === 'string' && ISO_RE.test(t.date)))
       )
-      .map((t) => ({ id: t.id, title: t.title, date: t.date, done: t.done }));
+      .map((t) => ({ id: t.id, title: t.title, date: t.date, done: t.done, urgent: t.urgent === true }));
   } catch {
     return [];
   }
@@ -132,6 +132,7 @@ const state = {
   sort: loadSort(),
   weekStart: startOfWeek(new Date()),
   editingId: null,
+  movingId: null,
 };
 
 const ui = {
@@ -142,10 +143,19 @@ const ui = {
   grid: null,
   newTitle: null,
   dayLists: new Map(),
+  pileCount: null,
 };
 
-function addTask(title, date) {
-  const task = { id: newId(), title, date, done: false };
+let dragId = null;
+const indicator = el('li', {className: 'drop-indicator', attrs: {'aria-hidden': 'true'}});
+
+function zoneKeyOf(task) {
+    return task.date && currentWeekDates().includes(task.date) ? task.date
+: 'pile';
+}
+
+function addTask(title, date, urgent = false) {
+  const task = { id: newId(), title, date, done: false, urgent };
   state.tasks.push(task);
   if (!matches(task)) resetFilters();
   saveTasks();
@@ -163,13 +173,14 @@ function toggleDone(id) {
 function deleteTask(id) {
   state.tasks = state.tasks.filter((t) => t.id !== id);
   if (state.editingId === id) state.editingId = null;
+  if (state.movingId === id) state.movingId = null;
   saveTasks();
   renderTasks();
 }
  
 function startEdit(id) {
   state.editingId = id;
-
+  state.movingId = null;
   renderTasks();
   const field = document.querySelector('.task-edit__title');
   if (field) field.focus();
@@ -177,11 +188,93 @@ function startEdit(id) {
  
 function cancelRowMode() {
   state.editingId = null;
+  state.movingId = null;
   renderTasks();
+}
+
+function startMove(id) {
+  state.movingId = id;
+  state.editingId = null;
+  renderTasks();
+  const select = document.querySelector('.task-move__select');
+  if (select) select.focus();
+}
+
+function moveTask(id, key, beforeId) {
+  const from = state.tasks.findIndex((t) => t.id === id);
+  if (from < 0) return;
+ 
+  const [task] = state.tasks.splice(from, 1);
+  task.date = key === 'pile' ? null : key;
+ 
+  let at = -1;
+  const ordered = !(key === 'pile' && state.sort !== 'manual');
+  if (ordered && beforeId && beforeId !== id) {
+    at = state.tasks.findIndex((t) => t.id === beforeId);
+  }
+  if (at < 0) {
+    let last = -1;
+    state.tasks.forEach((t, i) => {
+      if (zoneKeyOf(t) === key) last = i;
+    });
+    at = last < 0 ? state.tasks.length : last + 1;
+  }
+ 
+  state.tasks.splice(at, 0, task);
+  saveTasks();
+  renderTasks();
+}
+ 
+function placeIndicator(list, y) {
+  const items = [...list.querySelectorAll('.task:not(.is-dragging)')];
+  const target =
+    items.find((li) => {
+      const rect = li.getBoundingClientRect();
+      return y < rect.top + rect.height / 2;
+    }) || null;
+ 
+  if (indicator.parentNode !== list || indicator.nextElementSibling !== target) {
+    list.insertBefore(indicator, target);
+  }
+}
+ 
+function finishDrag() {
+  dragId = null;
+  indicator.remove();
+  document.querySelectorAll('.is-over').forEach((n) => n.classList.remove('is-over'));
+  document.querySelectorAll('.is-dragging').forEach((n) => n.classList.remove('is-dragging'));
+}
+ 
+function attachDropZone(zone, list, key) {
+  zone.addEventListener('dragover', (e) => {
+    if (!dragId) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+    zone.classList.add('is-over');
+    if (key === 'pile' && state.sort !== 'manual') return;
+    placeIndicator(list, e.clientY);
+  });
+ 
+  zone.addEventListener('dragleave', (e) => {
+    if (e.relatedTarget && zone.contains(e.relatedTarget)) return;
+    zone.classList.remove('is-over');
+    if (indicator.parentNode === list) indicator.remove();
+  });
+ 
+  zone.addEventListener('drop', (e) => {
+    if (!dragId) return;
+    e.preventDefault();
+    const next = indicator.parentNode === list ? indicator.nextElementSibling : null;
+    const beforeId = (next && next.dataset && next.dataset.id) || null;
+    const id = dragId;
+    finishDrag();
+    moveTask(id, key, beforeId);
+  });
 }
 
 function buildTaskRow(task, today, showDate) {
   if (state.editingId === task.id) return buildEditRow(task);
+  if (state.movingId === task.id) return buildMoveRow(task);
 
   const status = task.done ? 'done' : !task.date ? 'undated' : task.date < today ? 'overdue' : 'upcoming';
   
@@ -195,10 +288,24 @@ function buildTaskRow(task, today, showDate) {
     on: { click: () => toggleDone(task.id) },
   });
 
+  const urgentMark =
+    task.urgent && !task.done
+      ? el(
+          'span',
+          { className: 'task__urgent', attrs: { title: 'Срочно' } },
+          el('span', { text: '!', attrs: { 'aria-hidden': 'true' } }),
+          el('span', { className: 'visually-hidden', text: 'срочно' })
+        )
+      : null;
+
   const title = el(
     'span',
     { className: 'task__title', text: task.title },
-    el('span', { className: 'visually-hidden', text: ` (${STATUS_TEXT[status]})` })
+    el('span', { className: 'visually-hidden', text: ` (${STATUS_TEXT[status]})` }),
+
+    status === 'overdue'
+      ? el('span', { className: 'task__flag', text: ' (бро.............)', attrs: { 'aria-hidden': 'true' } })
+      : null
   );
  
   const date =
@@ -209,6 +316,13 @@ function buildTaskRow(task, today, showDate) {
    const actions = el(
     'div',
     { className: 'task__actions' },
+    el('button', {
+      className: 'task__btn',
+      text: '⇄',
+      attrs: { type: 'button', 'aria-label': `Перенести: ${task.title}`, title: 'Перенести' },
+      on: { click: () => startMove(task.id) },
+    }),
+
     el('button', {
       className: 'task__btn',
       text: '✎',
@@ -228,12 +342,24 @@ function buildTaskRow(task, today, showDate) {
     {
       className: `task task--${status}`,
       dataset: { id: task.id },
+      attrs: { draggable: 'true' },
     },
     check,
+    urgentMark,
     title,
     date,
-    actions
+    actions,
   );
+
+  li.addEventListener('dragstart', (e) => {
+    dragId = task.id;
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', task.id);
+    }
+    requestAnimationFrame(() => li.classList.add('is-dragging'));
+  });
+  li.addEventListener('dragend', finishDrag);
 
   return li;
 }
@@ -252,7 +378,8 @@ function buildEditRow(task) {
   dateInput.value = task.date || '';
  
   const error = el('p', { className: 'form-error', attrs: { role: 'alert' } });
- 
+  const urgentBtn = buildUrgentToggle(Boolean(task.urgent));
+
   const form = el(
     'form',
     {
@@ -270,6 +397,7 @@ function buildEditRow(task) {
           }
           task.title = title;
           task.date = dateInput.value || null;
+          task.urgent = isUrgent(urgentBtn);
           state.editingId = null;
           saveTasks();
           renderTasks();
@@ -284,6 +412,7 @@ function buildEditRow(task) {
       'div',
       { className: 'task-edit__row' },
       dateInput,
+      urgentBtn,
       el('button', { className: 'btn btn--small btn--primary', text: 'Сохранить', attrs: { type: 'submit' } }),
       el('button', {
         className: 'btn btn--small',
@@ -302,6 +431,67 @@ function buildEditRow(task) {
  
   return el('li', { className: 'task task--editing', dataset: { id: task.id } }, form);
 }
+
+function buildMoveRow(task) {
+  const current = zoneKeyOf(task);
+  const select = el('select', {
+    className: 'task-move__select',
+    attrs: { 'aria-label': `Куда перенести: ${task.title}` },
+    on: {
+      change: (e) => {
+        const key = e.target.value;
+        if (!key) return;
+        state.movingId = null;
+        moveTask(task.id, key, null);
+      },
+      keydown: (e) => {
+        if (e.key === 'Escape') cancelRowMode();
+      },
+    },
+  });
+ 
+  select.append(el('option', { text: 'Перенести в…', attrs: { value: '', disabled: true, selected: true } }));
+  if (current !== 'pile') select.append(el('option', { text: 'Общий список задач', attrs: { value: 'pile' } }));
+  currentWeekDates().forEach((iso, i) => {
+    if (iso === current) return;
+    select.append(el('option', { text: `${DAY_NAMES[i]}, ${shortDate(iso)}`, attrs: { value: iso } }));
+  });
+ 
+  return el(
+    'li',
+    { className: 'task task--moving', dataset: { id: task.id } },
+    el(
+      'div',
+      { className: 'task-move' },
+      el('span', { className: 'task__title', text: task.title }),
+      el(
+        'div',
+        { className: 'task-edit__row' },
+        select,
+        el('button', {
+          className: 'btn btn--small',
+          text: 'Отмена',
+          attrs: { type: 'button' },
+          on: { click: cancelRowMode },
+        })
+      )
+    )
+  );
+}
+
+function buildUrgentToggle(initial) {
+  const btn = el('button', {
+    className: 'urgent-toggle',
+    text: '!',
+    attrs: { type: 'button', 'aria-pressed': String(initial), 'aria-label': 'Срочно', title: 'Срочно' },
+  });
+  btn.addEventListener('click', () => {
+    btn.setAttribute('aria-pressed', String(btn.getAttribute('aria-pressed') !== 'true'));
+  });
+  return btn;
+}
+ 
+const isUrgent = (btn) => btn.getAttribute('aria-pressed') === 'true';
 
 function compareByDate(a, b) {
   if (a.date === b.date) return 0;
@@ -330,13 +520,14 @@ function renderTasks() {
     const filtersActive = state.query !== '' || state.filter !== 'all';
     const message =
       state.tasks.length === 0
-        ? 'Пока нет задач. Добавь первую выше.'
+        ? 'Пока нет задач. Добавьте первую выше.'
         :filtersActive
           ? 'Ничего не найдено...'
           : 'Список пуст — всё распланировано.';
     pileNodes.push(el('li', { className: 'empty', text: message }));
   }
   ui.pileList.replaceChildren(...pileNodes);
+  ui.pileCount.textContent = String(pileTasks.length);
  
   ui.dayLists.forEach((list, iso) => {
     list.replaceChildren(...groups.get(iso).map((task) => buildTaskRow(task, today, false)));
@@ -352,40 +543,24 @@ function updateFilterButtons() {
 }
  
 function buildToolbar() {
-  ui.search = el('input', {
-    className: 'toolbar__search',
-    attrs: {
-      type: 'search',
-      placeholder: 'Поиск по названию',
-      'aria-label': 'Поиск задач по названию',
-      autocomplete: 'off',
-    },
-    on: {
-      input: (e) => {
-        state.query = e.target.value.trim().toLowerCase();
-        renderTasks();
-      },
-    },
+    const group = el('div', {
+        className: 'segmented',
+        attrs: { role: 'group', 'aria-label': 'Фильтр по статусу' },
   });
- 
-  const group = el('div', {
-    className: 'segmented',
-    attrs: { role: 'group', 'aria-label': 'Фильтр по статусу' },
-  });
-  ui.filterButtons = FILTERS.map(([value, label]) => {
-    const btn = el('button', {
-      className: 'segmented__btn',
-      text: label,
-      attrs: { type: 'button' },
-      dataset: { filter: value },
-      on: {
-        click: () => {
-          state.filter = value;
-          updateFilterButtons();
-          renderTasks();
-        },
-      },
-    });
+    ui.filterButtons = FILTERS.map(([value, label]) => {
+        const btn = el('button', {
+            className: 'segmented__btn',
+            text: label,
+            attrs: { type: 'button' },
+            dataset: { filter: value },
+            on: {
+                click: () => {
+                    state.filter = value;
+                    updateFilterButtons();
+                    renderTasks();
+                },
+            },
+        });
     group.append(btn);
     return btn;
   });
@@ -410,10 +585,16 @@ function buildToolbar() {
 
 const newId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 
+const normalize = (text) => text.toLowerCase().replaceAll('ё', 'е');
+
 function matches(task) {
   if (state.filter === 'active' && task.done) return false;
   if (state.filter === 'done' && !task.done) return false;
-  if (state.query && !task.title.toLowerCase().includes(state.query)) return false;
+  if (state.query) {
+    const title = normalize(task.title);
+    const words = normalize(state.query).split(/\s+/).filter(Boolean);
+    if (!words.every((word) => title.includes(word))) return false;
+  }
   return true;
 }
  
@@ -438,6 +619,7 @@ function buildHeader() {
 }
 
 function buildPile() {
+  ui.pileCount = el('span', { className: 'pile__count', attrs: { 'aria-label': 'Количество задач' } });
   ui.pileList = el('ul', { className: 'task-list pile__list', attrs: { 'aria-label': 'Список дел' } });
  
   ui.newTitle = el('input', {
@@ -454,6 +636,7 @@ function buildPile() {
     className: 'field field--date',
     attrs: { type: 'date', 'aria-label': 'Дата (необязательно)' },
   });
+  const newUrgent = buildUrgentToggle(false);
   const error = el('p', { className: 'form-error', attrs: { role: 'alert' } });
  
   ui.newTitle.addEventListener('input', () => {
@@ -476,7 +659,8 @@ function buildPile() {
             ui.newTitle.focus();
             return;
           }
-          addTask(title, newDate.value || null);
+          addTask(title, newDate.value || null, isUrgent(newUrgent));
+          newUrgent.setAttribute('aria-pressed', 'false');
           ui.newTitle.value = '';
           newDate.value = '';
           ui.newTitle.focus();
@@ -488,6 +672,7 @@ function buildPile() {
       'div',
       { className: 'add-form__row' },
       newDate,
+      newUrgent,
       el('button', { className: 'btn btn--primary', text: 'Добавить', attrs: { type: 'submit' } })
     ),
     error
@@ -514,17 +699,35 @@ function buildPile() {
     ui.sortSelect
   );
 
+  ui.search = el('input', {
+    className: 'field pile__search',
+    attrs: {
+      type: 'search',
+      placeholder: 'Поиск по названию',
+      'aria-label': 'Поиск задач по названию',
+      autocomplete: 'off',
+    },
+    on: {
+      input: (e) => {
+        state.query = e.target.value.trim().toLowerCase();
+        renderTasks();
+      },
+    },
+  });
+
   const section = el(
     'section',
     { className: 'pile' },
-    el('h2', { className: 'section-title section-title--split' }, el('span', { text: 'Список дел' })),
+    el('h2', { className: 'section-title section-title--split' }, el('span', { text: 'Список дел' }), ui.pileCount),
     el('p', {
       className: 'pile__hint',
     }),
     form,
+    ui.search,
     ui.pileList,
     sortRow
   );
+  attachDropZone(section, ui.pileList, 'pile');
   return section;
 }
 
@@ -574,8 +777,10 @@ function buildDay(iso, index, todayISO) {
     ),
     el('time', { className: 'day__date', text: `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`, attrs: { datetime: iso } })
   );
+  const section = el('section', { className: isToday ? 'day day--today' : 'day' }, title, list, addForm);
 
-  return el('section', { className: isToday ? 'day day--today' : 'day' }, title, list, addForm);
+  attachDropZone(section, list, iso);
+  return section;
 }
 
 function renderWeek() {
@@ -589,11 +794,41 @@ function renderWeek() {
   ui.rangeLabel.textContent = `${fmtDay.format(state.weekStart)} — ${fmtFull.format(addDays(state.weekStart, 6))}`;
 }
 
+function showWeek(start) {
+  state.weekStart = start;
+  state.editingId = null;
+  state.movingId = null;
+  renderWeek();
+  renderTasks();
+}
+
 function buildWeekSection() {
   ui.rangeLabel = el('h2', { className: 'week-nav__range', attrs: { 'aria-live': 'polite' } });
   ui.grid = el('div', { className: 'week__grid' });
 
-  const nav = el('nav', { className: 'week-nav', attrs: { 'aria-label': 'Неделя' } }, ui.rangeLabel);
+  const nav = el(
+    'nav',
+    { className: 'week-nav', attrs: { 'aria-label': 'Навигация по неделям' } },
+    el('button', {
+      className: 'btn btn--icon',
+      text: '‹',
+      attrs: { type: 'button', 'aria-label': 'Предыдущая неделя' },
+      on: { click: () => showWeek(addDays(state.weekStart, -7)) },
+    }),
+    ui.rangeLabel,
+    el('button', {
+      className: 'btn btn--icon',
+      text: '›',
+      attrs: { type: 'button', 'aria-label': 'Следующая неделя' },
+      on: { click: () => showWeek(addDays(state.weekStart, 7)) },
+    }),
+    el('button', {
+      className: 'btn',
+      text: 'Сегодня',
+      attrs: { type: 'button' },
+      on: { click: () => showWeek(startOfWeek(new Date())) },
+    })
+  );
 
   return el('section', { className: 'week' }, nav, ui.grid);
 }
